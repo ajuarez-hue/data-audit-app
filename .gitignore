@@ -1,0 +1,33 @@
+# Datos sensibles — nunca subir bases de datos reales
+*.csv
+*.dta
+*.xlsx
+*.xls
+
+# Excepción: sí subir el requirements.txt y archivos de config
+!requirements.txt
+
+# Archivos generados
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Streamlit cache local
+.streamlit/secrets.toml
+
+# Documentos generados localmente
+*.docx
+*.pdf
+
+# Scripts de generación de datos de prueba (uso interno)
+generar_*.py
+
+# Logo (cada equipo lo coloca en su carpeta local)
+logo_equilibrium.png
+
+# IDEs
+.vscode/
+.idea/
+*.swp
