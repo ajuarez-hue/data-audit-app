@@ -12,7 +12,6 @@ import plotly.graph_objects as go
 LOGO_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logo_equilibrium.png")
 
 # ── Paleta de colores Equi ─────────────────────────────────────────────
-# Centralizada aquí para que un cambio de branding solo requiera editar este bloque.
 BRAND = {
     "navy":   "#020f50",   # color principal de marca
     "blue":   "#1955a6",   # azul secundario
@@ -52,8 +51,6 @@ for k, v in _SESSION_DEFAULTS.items():
 
 # ──────────────────────────────────────────────────────────────
 # 1. ESTILOS CSS
-# Los tokens de color fijos (navy, blue, yellow, etc.) vienen del dict BRAND
-# definido al inicio del script — editar allí para cambios de branding.
 # ──────────────────────────────────────────────────────────────
 def get_css(dark=False):
     if dark:
@@ -1270,6 +1267,42 @@ if modulo == "📋  Revisión de Encuesta":
             st.markdown("<div class='section-title'>Listas de opciones (choices)</div>",
                         unsafe_allow_html=True)
             col_list = next((c for c in df_ch.columns if "list" in c.lower()), None)
+            col_name_ch = next((c for c in df_ch.columns if c.lower() == "name"), None)
+            col_lbl_ch  = normalizar_label(df_ch)
+
+            # ── Alerta de duplicados dentro de cada lista ────────
+            # Detecta nombres (value) o etiquetas repetidos dentro
+            # de la misma list_name — provoca bloqueos en ODK/KoBo.
+            if col_list and col_name_ch:
+                _dups_nombre = (
+                    df_ch.groupby([col_list, col_name_ch])
+                    .size().reset_index(name="n")
+                    .query("n > 1")
+                )
+                _dups_label = pd.DataFrame()
+                if col_lbl_ch:
+                    _dups_label = (
+                        df_ch.groupby([col_list, col_lbl_ch])
+                        .size().reset_index(name="n")
+                        .query("n > 1")
+                    )
+
+                if not _dups_nombre.empty or not _dups_label.empty:
+                    st.markdown(
+                        "<div class='eq-err'>⚠️ <b>Duplicados detectados en choices</b> — "
+                        "pueden generar bloqueos en el formulario.</div>",
+                        unsafe_allow_html=True)
+                    if not _dups_nombre.empty:
+                        st.caption("**Nombres (value) duplicados dentro de la misma lista:**")
+                        st.dataframe(_dups_nombre, use_container_width=True, hide_index=True)
+                    if not _dups_label.empty:
+                        st.caption("**Etiquetas (label) duplicadas dentro de la misma lista:**")
+                        st.dataframe(_dups_label, use_container_width=True, hide_index=True)
+                else:
+                    st.markdown(
+                        "<div class='eq-ok'>✅ Sin nombres ni etiquetas duplicados en ninguna lista.</div>",
+                        unsafe_allow_html=True)
+
             if col_list:
                 listas = sorted(df_ch[col_list].dropna().unique())
                 sel = st.selectbox("Filtrar por lista:", ["(mostrar todas)"] + list(listas))
@@ -1424,13 +1457,54 @@ else:
 
     cols_num = [c for c in df.select_dtypes(include="number").columns
                 if not (col_dur and c == col_dur) and c not in flags_previos]
+
+    # ── Configuración del método de detección de outliers ────
+    # El usuario puede elegir entre IQR (robusto para distribuciones asimétricas)
+    # y Desviaciones estándar (para distribuciones aproximadamente normales).
+    with st.expander("⚙️ Configuración de outliers", expanded=False):
+        _oc1, _oc2 = st.columns(2)
+        with _oc1:
+            _metodo_out = st.radio(
+                "Método de detección:",
+                ["IQR (Tukey)", "Desviaciones estándar"],
+                index=0,
+                help="IQR es más robusto ante distribuciones asimétricas. "
+                     "Desviaciones estándar asume distribución aproximadamente normal.",
+                key="metodo_outliers",
+            )
+        with _oc2:
+            if _metodo_out == "IQR (Tukey)":
+                _factor_out = st.number_input(
+                    "Factor IQR (k):",
+                    min_value=0.5, max_value=5.0, value=1.5, step=0.25,
+                    help="Límites: Q1 − k×IQR y Q3 + k×IQR. "
+                         "El estándar de Tukey es 1.5. Valores mayores = menos sensible.",
+                    key="factor_iqr",
+                )
+            else:
+                _factor_out = st.number_input(
+                    "N° de desviaciones estándar:",
+                    min_value=1.0, max_value=5.0, value=2.0, step=0.5,
+                    help="Límites: media ± n×σ. "
+                         "El valor estándar es 2 (≈95% de los datos en dist. normal).",
+                    key="factor_std",
+                )
+
     resultados_iqr, outliers_det = [], []
     for col in cols_num:
         serie = df[col].dropna()
         if serie.empty:
             continue
-        q1, q3 = serie.quantile(.25), serie.quantile(.75)
-        iqr = q3 - q1; li, ls = q1 - 1.5*iqr, q3 + 1.5*iqr
+        # Calcular límites según el método elegido por el usuario
+        if _metodo_out == "IQR (Tukey)":
+            q1, q3 = serie.quantile(.25), serie.quantile(.75)
+            iqr = q3 - q1
+            li, ls = q1 - _factor_out * iqr, q3 + _factor_out * iqr
+        else:
+            # Desviaciones estándar: media ± n×σ
+            _media, _std = serie.mean(), serie.std()
+            li, ls = _media - _factor_out * _std, _media + _factor_out * _std
+            q1, q3 = serie.quantile(.25), serie.quantile(.75)  # para mostrar en tabla
         n_out = int(((serie < li) | (serie > ls)).sum())
         resultados_iqr.append({
             "Variable": col,
@@ -1510,8 +1584,12 @@ else:
         st.markdown("<div class='section-title'>Flags calculados por la app</div>", unsafe_allow_html=True)
         df_fl = df_flags.copy()
         df_fl["encuesta_válida"] = df_fl["encuesta_válida"].map({1: "✅ Válida", 0: "⚠️ Con problema"})
-        cols_fl = ["ID", "Missings", "flag_missings", "flag_duplicados",
-                   "Duración (min)", "flag_duracion", "encuesta_válida"]
+        # flag_missings solo tiene sentido cuando hay instrumento cargado:
+        # sin instrumento, cualquier celda vacía cuenta como missing (número inflado
+        # que confunde). Con instrumento, el flag refleja solo missings reales.
+        cols_fl = ["ID", "flag_duplicados", "Duración (min)", "flag_duracion", "encuesta_válida"]
+        if inst_ok:
+            cols_fl.insert(1, "flag_missings")
         if df_flags["flag_duracion"].sum() == 0 and not col_dur:
             cols_fl = [c for c in cols_fl if c not in ("Duración (min)", "flag_duracion")]
         st.dataframe(colorear_flags(df_fl[cols_fl]), use_container_width=True, hide_index=True)
@@ -1676,18 +1754,18 @@ else:
                 enc_con_miss     = int((df_miss_enc["Miss. reales"] > 0).sum())
                 enc_con_skip     = int((df_miss_enc["Skips inválidos"] > 0).sum())
 
-                # Total crudo para comparación
+                # total_crudo solo se usa internamente para el mensaje
+                # explicativo — ya no se muestra como métrica para evitar
+                # confusión (número inflado sin considerar relevancia).
                 total_crudo = int(df.isnull().sum().sum())
 
-            mi1, mi2, mi3, mi4 = st.columns(4)
-            mi1.metric("Missings reales",    f"{total_miss_real:,}",
-                       help="Celdas vacías que SÍ debían tener dato (condición relevant cumplida o sin condición)")
-            mi2.metric("Skips inválidos",    f"{total_skip_inv:,}",
-                       help="Celdas con dato cuando la pregunta NO debía mostrarse (posible error de programación)")
-            mi3.metric("Encuestas afectadas",f"{enc_con_miss:,}",
+            mi1, mi2, mi3 = st.columns(3)
+            mi1.metric("Missings reales",     f"{total_miss_real:,}",
+                       help="Celdas vacías que SÍ debían tener dato (relevant cumplido o sin condición)")
+            mi2.metric("Skips inválidos",     f"{total_skip_inv:,}",
+                       help="Celdas con dato cuando la pregunta NO debía mostrarse — posible error de programación")
+            mi3.metric("Encuestas afectadas", f"{enc_con_miss:,}",
                        help="Encuestas con al menos 1 missing real")
-            mi4.metric("Celdas vacías crudas",f"{total_crudo:,}",
-                       help="Total de celdas NULL en la base sin considerar relevancia (número inflado)")
 
             if total_miss_real < total_crudo:
                 diff = total_crudo - total_miss_real
@@ -2077,11 +2155,25 @@ else:
         else:
             st.markdown("<div class='section-title'>Diagnóstico cruzado instrumento ↔ base</div>",
                         unsafe_allow_html=True)
+            # Metadatos de plataforma que se excluyen automáticamente del reporte
+            # de columnas huérfanas — son generados por ODK/KoBo/SurveyCTO,
+            # no son variables del instrumento y no aportan al análisis.
+            # Se mantienen username y duration por ser útiles en la auditoría.
+            _META_PLATAFORMA = {
+                "_id","_uuid","_submission_time","_submitted_by","_version",
+                "_tags","_notes","_index","_parent_index","_parent_table_name",
+                "instanceid","instancename","formdef_version","caseid",
+                "key","meta","meta/instanceid","meta/instancename",
+                "start","end","today","deviceid",
+            }
+
             vars_inst = set(mapa_labels.keys())
             vars_db   = set(df.columns)
             en_ambos  = vars_inst & vars_db
             solo_inst = vars_inst - vars_db
-            solo_db   = vars_db   - vars_inst
+            # Huérfanas reales = en la base, sin definición en instrumento,
+            # excluyendo metadatos de plataforma conocidos.
+            solo_db   = vars_db - vars_inst - _META_PLATAFORMA
 
             m1, m2, m3 = st.columns(3)
             m1.metric("Variables mapeadas",      len(en_ambos))
@@ -2112,8 +2204,9 @@ else:
                 if solo_db:
                     st.caption("**Columnas huérfanas (en base, sin definición en instrumento)**")
                     st.markdown(
-                        "<div class='eq-err'>Típicamente metadatos del sistema (_id, _uuid) "
-                        "o variables no documentadas.</div>", unsafe_allow_html=True)
+                        "<div class='eq-warn'>Variables en la base sin documentación en el instrumento. "
+                        "Los metadatos de plataforma (_uuid, deviceid, etc.) se excluyen automáticamente.</div>",
+                        unsafe_allow_html=True)
                     st.dataframe(pd.DataFrame({
                         "Variable":    sorted(solo_db),
                         "Tipo en base":[str(df[c].dtype) for c in sorted(solo_db)],
@@ -2158,95 +2251,246 @@ else:
         df_w = st.session_state.df_work
 
         # ════════════════════════════════════════════════════════
-        # EDITOR DE DATOS — edición celda a celda estilo Stata
+        # EDITOR DE DATOS — estilo Case Management SurveyCTO
+        # Flujo: filtros → lista de casos → seleccionar uno →
+        #        detalle completo campo por campo → guardar.
+        # Editar un solo caso a la vez elimina el riesgo de
+        # modificar la fila equivocada en bases extensas.
         # ════════════════════════════════════════════════════════
         st.markdown("<div class='section-title'>✏️ Editor de datos</div>",
                     unsafe_allow_html=True)
-        st.caption(
-            "Edita cualquier celda directamente — útil para corregir valores tras "
-            "verificar con el encuestador. Cada cambio queda registrado en el log. "
-            "Columnas de sistema están bloqueadas.")
 
-        # Columnas de sistema que no se deben editar
-        _SYS_LOCK = {"_id","_uuid","_submission_time","deviceid","_version",
-                     "_submitted_by","KEY","key","instanceid","instancename",
-                     "_index","_parent_index","_tags","_notes"}
-        _locked = [c for c in df_w.columns if c.lower() in _SYS_LOCK
-                   or c.lower().startswith("_")]
-        _editable = [c for c in df_w.columns if c not in _locked]
+        _col_enc_edit = st.session_state.get("col_enc_key")
 
-        # Construir column_config: bloqueadas en gris, editables libres
-        _edit_cfg = {}
-        for c in df_w.columns:
-            if c in _locked:
-                _edit_cfg[c] = st.column_config.TextColumn(c, disabled=True)
-            else:
-                # Detectar tipo para usar el widget correcto
-                if pd.api.types.is_integer_dtype(df_w[c]):
-                    _edit_cfg[c] = st.column_config.NumberColumn(c, disabled=False)
-                elif pd.api.types.is_float_dtype(df_w[c]):
-                    _edit_cfg[c] = st.column_config.NumberColumn(c, disabled=False,
-                                                                  format="%.4f")
+        # ── PANEL DE FILTROS ─────────────────────────────────────
+        # Igual que el Case Management: filtros al tope para acotar
+        # la lista de casos antes de seleccionar uno.
+        with st.container():
+            _fe1, _fe2, _fe3 = st.columns([2, 2, 1])
+
+            with _fe1:
+                if _col_enc_edit and _col_enc_edit in df_w.columns:
+                    _encs_disp = ["Todos"] + sorted(
+                        df_w[_col_enc_edit].astype(str).dropna().unique().tolist())
+                    _enc_sel = st.selectbox("👤 Encuestador:", _encs_disp,
+                                            key="cm_filtro_enc")
+                    _enc_filtro = None if _enc_sel == "Todos" else _enc_sel
                 else:
-                    _edit_cfg[c] = st.column_config.TextColumn(c, disabled=False)
+                    st.caption("_(columna encuestador no configurada)_")
+                    _enc_filtro = None
 
-        edited_df = st.data_editor(
-            df_w.copy(),
-            column_config=_edit_cfg,
-            hide_index=False,
-            use_container_width=True,
-            key="editor_datos",
-            height=min(600, max(250, len(df_w) * 38 + 50)),
-            num_rows="fixed",   # no permitir agregar/borrar filas desde aquí
+            with _fe2:
+                _id_filtro = st.text_input(
+                    "🔍 Buscar ID:",
+                    placeholder="ID exacto o parcial…",
+                    key="cm_filtro_id",
+                )
+
+            with _fe3:
+                st.markdown("<br>", unsafe_allow_html=True)
+                _solo_flags = st.checkbox("⚠️ Solo con flags", key="cm_filtro_flags")
+
+        # ── CONSTRUIR LISTA DE CASOS FILTRADA ───────────────────
+        _df_lista = df_w.copy().reset_index(drop=True)
+        _df_lista["_row_idx"] = _df_lista.index   # conservar posición original
+
+        if _enc_filtro and _col_enc_edit and _col_enc_edit in _df_lista.columns:
+            _df_lista = _df_lista[_df_lista[_col_enc_edit].astype(str) == _enc_filtro]
+
+        if _id_filtro.strip() and col_id and col_id in _df_lista.columns:
+            _df_lista = _df_lista[
+                _df_lista[col_id].astype(str).str.contains(
+                    _id_filtro.strip(), case=False, na=False)
+            ]
+
+        if _solo_flags:
+            try:
+                _ids_flag = set(
+                    flags_en_trabajo.reset_index(drop=True)
+                    .loc[flags_en_trabajo["encuesta_válida"].values == 0, "ID"]
+                    .astype(str)
+                )
+                if col_id and col_id in _df_lista.columns:
+                    _df_lista = _df_lista[_df_lista[col_id].astype(str).isin(_ids_flag)]
+            except Exception:
+                pass
+
+        _n_total   = len(df_w)
+        _n_visible = len(_df_lista)
+
+        # ── TABLA RESUMEN DE CASOS (lista superior) ──────────────
+        # Muestra solo las columnas más relevantes para elegir el caso,
+        # igual que el panel izquierdo del Case Management de SurveyCTO.
+        _cols_lista = []
+        if col_id and col_id in _df_lista.columns:
+            _cols_lista.append(col_id)
+        if _col_enc_edit and _col_enc_edit in _df_lista.columns:
+            _cols_lista.append(_col_enc_edit)
+        if col_dur and col_dur in _df_lista.columns:
+            _cols_lista.append(col_dur)
+        # Agregar flag de estado
+        _df_lista_disp = _df_lista[_cols_lista].copy() if _cols_lista else _df_lista.copy()
+        try:
+            _flag_estado = flags_en_trabajo.reset_index(drop=True)
+            _ids_series  = (df_w[col_id].astype(str).reset_index(drop=True)
+                            if col_id and col_id in df_w.columns
+                            else pd.Series(df_w.index.astype(str)))
+            _estado_map  = dict(zip(
+                _flag_estado["ID"].astype(str),
+                _flag_estado["encuesta_válida"].map({1: "✅ Válida", 0: "⚠️ Con flag"})
+            ))
+            if col_id and col_id in _df_lista.columns:
+                _df_lista_disp["Estado"] = (
+                    _df_lista[col_id].astype(str).map(_estado_map).fillna("—").values
+                )
+        except Exception:
+            pass
+
+        st.caption(
+            f"**{_n_visible}** caso(s) encontrados"
+            + (f" de {_n_total}" if _n_visible < _n_total else "")
+            + " — selecciona uno para ver y editar su detalle completo."
         )
 
-        # Detectar cambios comparando con df_w celda a celda
-        _cambios_nuevos = []
-        for _c in _editable:
-            if _c not in edited_df.columns:
-                continue
-            for _i in df_w.index:
-                _v_antes = df_w.at[_i, _c]
-                _v_desp  = edited_df.at[_i, _c]
-                # Comparar ignorando NaN==NaN
-                _ambos_nan = pd.isna(_v_antes) and pd.isna(_v_desp)
-                if not _ambos_nan and _v_antes != _v_desp:
-                    _id_val = (str(df_w.at[_i, col_id])
-                               if (col_id and col_id in df_w.columns)
-                               else str(_i))
-                    _cambios_nuevos.append({
-                        "ID":       _id_val,
-                        "Variable": _c,
-                        "Antes":    _v_antes,
-                        "Después":  _v_desp,
-                    })
-
-        if _cambios_nuevos:
-            st.markdown(
-                f"<div class='eq-warn'>"
-                f"✏️ <b>{len(_cambios_nuevos)}</b> cambio(s) pendiente(s) — "
-                f"presiona <b>Aplicar cambios</b> para guardarlos."
-                f"</div>", unsafe_allow_html=True)
-            st.dataframe(pd.DataFrame(_cambios_nuevos),
-                         use_container_width=True, hide_index=True)
-
-            if st.button("💾 Aplicar cambios al dataset", type="primary",
-                         key="btn_aplicar_edicion"):
-                # Guardar en df_work
-                st.session_state.df_work = edited_df.copy()
-                # Registrar en log de cambios
-                for _ch in _cambios_nuevos:
-                    st.session_state.cambios_log.append(
-                        f"[Editor manual] ID {_ch['ID']} · "
-                        f"{_ch['Variable']}: «{_ch['Antes']}» → «{_ch['Después']}»"
-                    )
-                st.success(f"✅ {len(_cambios_nuevos)} cambio(s) guardados en el dataset.")
-                st.rerun()
+        # Selector de caso: muestra la tabla resumen y un selectbox para elegir
+        if _n_visible == 0:
+            st.info("Ningún caso coincide con los filtros activos.")
         else:
-            st.markdown(
-                "<div class='eq-ok'>Sin cambios pendientes — "
-                "edita cualquier celda arriba para corregir valores.</div>",
-                unsafe_allow_html=True)
+            st.dataframe(_df_lista_disp.reset_index(drop=True),
+                         use_container_width=True, hide_index=True, height=220)
+
+            # Selector del caso a editar
+            if col_id and col_id in _df_lista.columns:
+                _opciones_id = _df_lista[col_id].astype(str).tolist()
+            else:
+                _opciones_id = [str(i) for i in _df_lista.index]
+
+            _caso_sel = st.selectbox(
+                "📋 Selecciona el caso a editar:",
+                options=_opciones_id,
+                key="cm_caso_sel",
+            )
+
+            # ── DETALLE DEL CASO SELECCIONADO ───────────────────
+            # Una vez elegido el caso, muestra todos sus campos
+            # editables organizados en columnas — un campo por widget,
+            # igual que el formulario de detalle en Case Management.
+            if _caso_sel:
+                if col_id and col_id in _df_lista.columns:
+                    _fila_mask = _df_lista[col_id].astype(str) == _caso_sel
+                    _fila_rows = _df_lista[_fila_mask]
+                else:
+                    _fila_rows = _df_lista.iloc[[int(_caso_sel)]]
+
+                if _fila_rows.empty:
+                    st.warning("No se encontró el caso seleccionado.")
+                else:
+                    _fila_idx  = int(_fila_rows["_row_idx"].iloc[0])
+                    _fila_data = df_w.loc[_fila_idx].copy()
+
+                    # Badge de estado del caso
+                    try:
+                        _est_caso = _estado_map.get(str(_fila_data.get(col_id, "")), "—")
+                    except Exception:
+                        _est_caso = "—"
+                    st.markdown(
+                        f"<div class='eq-info' style='margin-bottom:12px;'>"
+                        f"<b>Caso:</b> {_caso_sel} &nbsp;·&nbsp; "
+                        f"<b>Estado:</b> {_est_caso}"
+                        + (f" &nbsp;·&nbsp; <b>Encuestador:</b> {_fila_data.get(_col_enc_edit, '—')}"
+                           if _col_enc_edit and _col_enc_edit in _fila_data.index else "")
+                        + "</div>",
+                        unsafe_allow_html=True,
+                    )
+
+                    # Columnas de sistema — solo lectura
+                    _SYS_LOCK = {"_id","_uuid","_submission_time","deviceid","_version",
+                                 "_submitted_by","KEY","key","instanceid","instancename",
+                                 "_index","_parent_index","_tags","_notes"}
+                    _locked   = {c for c in df_w.columns
+                                 if c.lower() in _SYS_LOCK or c.lower().startswith("_")}
+                    _editable = [c for c in df_w.columns if c not in _locked]
+
+                    # Renderizar campos en grupos de 3 columnas
+                    st.markdown("**Campos editables**")
+                    _nuevos_vals = {}
+                    _campos_cols = st.columns(3)
+                    for _ci, _col_name in enumerate(_editable):
+                        _val_actual = _fila_data.get(_col_name)
+                        _lbl = (f"{mapa_labels[_col_name]}" if _col_name in mapa_labels
+                                else _col_name)
+                        with _campos_cols[_ci % 3]:
+                            if pd.api.types.is_integer_dtype(df_w[_col_name]):
+                                _nuevos_vals[_col_name] = st.number_input(
+                                    _lbl, value=int(_val_actual) if pd.notna(_val_actual) else 0,
+                                    step=1, key=f"cm_field_{_col_name}",
+                                )
+                            elif pd.api.types.is_float_dtype(df_w[_col_name]):
+                                _nuevos_vals[_col_name] = st.number_input(
+                                    _lbl, value=float(_val_actual) if pd.notna(_val_actual) else 0.0,
+                                    format="%.4f", key=f"cm_field_{_col_name}",
+                                )
+                            else:
+                                _nuevos_vals[_col_name] = st.text_input(
+                                    _lbl,
+                                    value=str(_val_actual) if pd.notna(_val_actual) else "",
+                                    key=f"cm_field_{_col_name}",
+                                )
+
+                    # Campos bloqueados colapsados
+                    with st.expander("🔒 Metadatos (solo lectura)", expanded=False):
+                        _meta_cols = st.columns(3)
+                        for _ci, _col_name in enumerate(sorted(_locked)):
+                            if _col_name in _fila_data.index:
+                                with _meta_cols[_ci % 3]:
+                                    st.text_input(
+                                        _col_name,
+                                        value=str(_fila_data.get(_col_name, "")),
+                                        disabled=True,
+                                        key=f"cm_meta_{_col_name}",
+                                    )
+
+                    # Detectar cambios en este caso
+                    _cambios_caso = []
+                    for _col_name, _val_nuevo in _nuevos_vals.items():
+                        _val_viejo = _fila_data.get(_col_name)
+                        _ambos_nan = pd.isna(_val_viejo) and pd.isna(_val_nuevo)
+                        _igual = _ambos_nan or (str(_val_viejo) == str(_val_nuevo))
+                        if not _igual:
+                            _cambios_caso.append({
+                                "Variable": _col_name,
+                                "Etiqueta": mapa_labels.get(_col_name, _col_name),
+                                "Antes":    _val_viejo,
+                                "Después":  _val_nuevo,
+                            })
+
+                    if _cambios_caso:
+                        st.markdown(
+                            f"<div class='eq-warn'>"
+                            f"✏️ <b>{len(_cambios_caso)}</b> campo(s) modificado(s) — "
+                            f"revisa abajo antes de guardar."
+                            f"</div>", unsafe_allow_html=True)
+                        st.dataframe(pd.DataFrame(_cambios_caso),
+                                     use_container_width=True, hide_index=True)
+
+                        if st.button("💾 Guardar cambios en este caso",
+                                     type="primary", key="cm_btn_guardar"):
+                            _df_nuevo = df_w.copy()
+                            for _col_name, _val_nuevo in _nuevos_vals.items():
+                                _df_nuevo.at[_fila_idx, _col_name] = _val_nuevo
+                            st.session_state.df_work = _df_nuevo
+                            for _ch in _cambios_caso:
+                                st.session_state.cambios_log.append(
+                                    f"[Editor] ID {_caso_sel} · "
+                                    f"{_ch['Variable']}: «{_ch['Antes']}» → «{_ch['Después']}»"
+                                )
+                            st.success(
+                                f"✅ {len(_cambios_caso)} cambio(s) guardados en el caso {_caso_sel}.")
+                            st.rerun()
+                    else:
+                        st.markdown(
+                            "<div class='eq-ok'>Sin cambios en este caso.</div>",
+                            unsafe_allow_html=True)
 
         st.divider()
 
